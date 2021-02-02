@@ -34,6 +34,9 @@ type
     handleMacros*: Table[string, NimNode]
     states*: seq[State]
     stateArgumentName*: NimNodeOf[nnkIdent]
+    schemeInit*: NimNode
+    schemeInitVariable*: NimNode
+    sharedDefaultAssignments*: NimNode
 
 var schemeQueue* {.compileTime.} = initDeque[Scheme]()
 var currentScheme* {.compileTime.}: Scheme
@@ -107,23 +110,20 @@ proc semStateLine(s: State, sch: Scheme, stmt: NimNode) =
             let stname = sch.stateArgumentName
             for v in s.obj:
               for vi in 0..<v.len - 2:
-                let a = skipPostfix(v[vi])
+                let a = skipPostfixPragma(v[vi])
                 stmt.last.insert(0, newProc(
                   name = a, procType = nnkTemplateDef,
                   params = [ident"auto"],
                   body = (quote do:
                     `stname`.`objName`.`a`),
                   pragmas = newTree(nnkPragma, ident"used")))
-            let sharedFlags = {scfSpreadShared, scfSharedObj} * sch.flags
-            if sharedFlags != {scfSpreadShared}:
+            if {scfSpreadShared, scfSharedObj} <= sch.flags:
               for v in sch.shared:
                 for vi in 0..<v.len - 2:
-                  let a = skipPostfix(v[vi])
+                  let a = skipPostfixPragma(v[vi])
                   var ob = stname
-                  if scfSpreadShared in sharedFlags:
-                    ob = newDotExpr(ob, objName)
-                  if scfSharedObj in sharedFlags:
-                    ob = newDotExpr(ob, ident"shared") 
+                  ob = newDotExpr(ob, objName)
+                  ob = newDotExpr(ob, ident"shared") 
                   stmt.last.insert(0, newProc(
                     name = a, procType = nnkTemplateDef,
                     params = [ident"auto"],
@@ -148,7 +148,7 @@ proc semStateLine(s: State, sch: Scheme, stmt: NimNode) =
     if stmt[4].findIdent"member" >= 0:
       for v in s.obj:
         for vi in 0..<v.len - 2:
-          let a = skipPostfix(v[vi])
+          let a = skipPostfixPragma(v[vi])
           let stname = sch.stateArgumentName
           stmt.last.insert(0, newProc(
             name = a, procType = nnkTemplateDef,
@@ -225,10 +225,27 @@ macro shared*(body) =
     for v in body:
       var typ: NimNode
       let defs = newTree(nnkIdentDefs)
-      for i in 0..<v.len-2:
+      let last2 = v.len - 2
+      let value = v[last2 + 1]
+      let valueExists = value.kind != nnkEmpty
+      for i in 0..<last2:
         defs.add(v[i])
-      if v[^2].kind != nnkEmpty:
-        typ = v[^2]
+        currentScheme.sharedDefaultAssignments.addToList(
+          newAssignment(
+            newDotExpr(
+              if scfSpreadShared in currentScheme.flags:
+                currentScheme.stateArgumentName
+              else:
+                currentScheme.schemeInitVariable,
+              if scfSharedObj in currentScheme.flags:
+                newDotExpr(ident"shared", v[i])
+              else:
+                v[i]),
+            value))
+      if v[last2].kind != nnkEmpty:
+        typ = v[last2]
+      else:
+        typ = quote do: typeof(`value`)
       defs.add(typ)
       defs.add(newEmptyNode()) # objects need this to be empty
       currentScheme.shared.add(defs)
@@ -240,7 +257,7 @@ macro shared*(body) =
 
 proc semLine(sch: Scheme, st: NimNode) =
   if st.kind in RoutineNodes and st[4].findIdent"behavior" >= 0:
-    sch.behaviors.add((skipPostfix(st[0]).strVal, st, nil))
+    sch.behaviors.add((skipPostfixPragma(st[0]).strVal, st, nil))
     if st[4].findIdent"init" >= 0:
       sch.initBehavior = some sch.behaviors.high
     sch.flow.add((true, st))
@@ -259,7 +276,7 @@ macro behavior*(st) =
     for s in st:
       discard getAst(behavior(s))
   else:
-    currentScheme.behaviors.add((st[0].skipPostfix.strVal, st, nil))
+    currentScheme.behaviors.add((st[0].skipPostfixPragma.strVal, st, nil))
     if st[4].findIdent"init" >= 0:
       currentScheme.initBehavior = some currentScheme.behaviors.high
     currentScheme.flow.add((true, st))
@@ -283,14 +300,14 @@ macro registerHandle*(body) =
     for s in body:
       result.add(getAst(registerHandle(s))) 
   elif body.kind == nnkProcDef:
-    let nameIdent = skipPostfix(body[0])
+    let nameIdent = skipPostfixPragma(body[0])
     let name = newLit($nameIdent)
     result = quote do:
       `body`
       static:
         currentScheme.handles[`name`] = `nameIdent`
   elif body.kind == nnkTemplateDef:
-    let nameIdent = skipPostfix(body[0])
+    let nameIdent = skipPostfixPragma(body[0])
     let name = newLit($nameIdent)
     var params: seq[NimNode]
     for i in 1..<body[3].len:
@@ -325,6 +342,21 @@ macro handle*(sig, body): untyped =
         `letSection`
         result = quote do:
           `templateBody`
+
+macro schemeInit*(varName, routine): untyped =
+  result = newEmptyNode()
+  case routine.kind
+  of nnkStmtList:
+    for r in routine:
+      discard getAst(schemeInit(varName, r))
+  of RoutineNodes:
+    currentScheme.schemeInit = routine
+    currentscheme.schemeInitVariable = varName
+  else:
+    error("unknown scheme init node kind " & $routine.kind, routine)
+
+template schemeInit*(routine): untyped =
+  schemeInit(result, routine)
 
 proc finishScheme(sch: Scheme): NimNode =
   let stateObjName = ident(sch.name & "Obj")
@@ -432,6 +464,7 @@ proc finishScheme(sch: Scheme): NimNode =
         schMem[4] = newEmptyNode()
     result.add(schMem)
   
+  var assignedSchemeDefaults = false
   var behIndex = 0
   for isBeh, f in sch.flow.items:
     if isBeh:
@@ -461,17 +494,38 @@ proc finishScheme(sch: Scheme): NimNode =
         caseBranch.add(defaults)
       if not elseBranch.isNil:
         caseBranch.add(elseBranch)
+      var empty = false
+      if f[6].kind == nnkEmpty: empty = true; f[6] = newStmtList()
+      elif f[6].kind != nnkStmtList: f[6] = newStmtList(f[6])
+      else: empty = f[6].len == 0
+      if scfSpreadShared notin sch.flags:
+        for v in sch.shared:
+          for vi in 0..<v.len - 2:
+            let a = skipPostfixPragma(v[vi])
+            var ob = sch.stateArgumentName
+            if scfSharedObj in sch.flags:
+              ob = newDotExpr(ob, ident"shared") 
+            f[6].insert(0, newProc(
+              name = a, procType = nnkTemplateDef,
+              params = [ident"auto"],
+              body = newDotExpr(ob, a),
+              pragmas = newTree(nnkPragma, ident"used")))
       var pragmas = f[4]
+      var isInit = false
       if pragmas.kind != nnkEmpty:
         if (let behi = pragmas.findIdent"behavior"; behi) >= 0:
           pragmas.del(behi)
         if (let ini = pragmas.findIdent"init"; ini) >= 0:
           pragmas.del(ini)
+          isInit = true
+          if scfSpreadShared in sch.flags:
+            f[6].insert(0, sch.sharedDefaultAssignments)
+            assignedSchemeDefaults = true
         if pragmas.len == 0:
           pragmas = newEmptyNode()
       f[4] = pragmas
-      if f.last.kind == nnkEmpty:
-        f[6] = newStmtList(caseBranch)
+      if empty:
+        f[6].add(newStmtList(caseBranch))
       else:
         var newPragmas = copyNimTree(pragmas)
         if newPragmas.kind != nnkEmpty:
@@ -491,6 +545,18 @@ proc finishScheme(sch: Scheme): NimNode =
         ))
       inc behIndex
     result.add(f)
+  
+  if not sch.schemeInit.isNil:
+    let init = copy sch.schemeInit
+    if init[6].isNil or init[6].kind == nnkEmpty: init[6] = newStmtList()
+    elif init[6].kind != nnkStmtList: init[6] = newStmtList(init[6])
+    if scfSpreadShared notin sch.flags:
+      init[6].insert(0, sch.sharedDefaultAssignments)
+      assignedSchemeDefaults = true
+    result.add(init)
+  
+  if not sch.sharedDefaultAssignments.isNil and not assignedSchemeDefaults:
+    warning("shared fields with default values never initialized", sch.sharedDefaultAssignments)
   #echo result.repr
 
 macro endScheme*() =
