@@ -18,6 +18,7 @@ type
     scfDeepRef # make state objects ref too (if ref) and remove their Obj suffix
     scfSpreadShared # put shared fields in every object
     scfSharedObj # separate SchemeSharedObj type for shared fields
+    scfEnumNoPrefix # no enum prefix for kind names
 
   Scheme* = ref object
     name*: string
@@ -52,12 +53,14 @@ proc addToEnum(sch: Scheme, state: State) =
 
 proc initScheme(sch: Scheme, name: string, flags: set[SchemeFlags], kindType: NimNode) =
   sch.name = name
+  sch.flags = flags
   if kindType.isNil:
     sch.stateEnum = newTree(nnkEnumTy, newEmptyNode())
-    for ch in name:
-      if isUpperAscii(ch):
-        sch.stateEnumPrefix.add(toLowerAscii(ch))
-    sch.stateEnumPrefix.add('s')
+    if scfEnumNoPrefix notin flags:
+      for ch in name:
+        if isUpperAscii(ch):
+          sch.stateEnumPrefix.add(toLowerAscii(ch))
+      sch.stateEnumPrefix.add('s')
     sch.kindType = ident(sch.name & "Kind")
   else:
     sch.kindType = kindType
@@ -203,7 +206,7 @@ macro state*(sn, body) =
 
 macro initScheme*(sn; flags: static[set[SchemeFlags]]) =
   let (name, kindType) = if sn.kind == nnkInfix: ($sn[1], sn[2]) else: ($sn, nil)
-  let sch = Scheme(flags: flags)
+  let sch = Scheme()
   schemeTable[name] = sch
   schemeQueue.addLast(sch)
   currentScheme = sch
@@ -230,18 +233,19 @@ macro shared*(body) =
       let valueExists = value.kind != nnkEmpty
       for i in 0..<last2:
         defs.add(v[i])
-        currentScheme.sharedDefaultAssignments.addToList(
-          newAssignment(
-            newDotExpr(
-              if scfSpreadShared in currentScheme.flags:
-                currentScheme.stateArgumentName
-              else:
-                currentScheme.schemeInitVariable,
-              if scfSharedObj in currentScheme.flags:
-                newDotExpr(ident"shared", v[i])
-              else:
-                v[i]),
-            value))
+        if valueExists:
+          currentScheme.sharedDefaultAssignments.addToList(
+            newAssignment(
+              newDotExpr(
+                if scfSpreadShared in currentScheme.flags:
+                  currentScheme.stateArgumentName
+                else:
+                  currentScheme.schemeInitVariable,
+                if scfSharedObj in currentScheme.flags:
+                  newDotExpr(ident"shared", v[i])
+                else:
+                  v[i]),
+              value))
       if v[last2].kind != nnkEmpty:
         typ = v[last2]
       else:
@@ -400,7 +404,7 @@ proc finishScheme(sch: Scheme): NimNode =
       let typedef = newTree(nnkTypeDef, sch.maybeExport(id), newEmptyNode(), obj)
       let ts = newTree(nnkTypeSection, typedef)
       let cmnId = ident(s.name)
-      if {scfRef, scfVar} * sch.flags != {}:
+      if {scfRef, scfVar} * sch.flags != {} and scfEnumNoPrefix notin sch.flags:
         let cmnTypedef = newTree(nnkTypeDef,
           newTree(nnkPragmaExpr, sch.maybeExport(cmnId), newTree(nnkPragma, ident"used")),
           newEmptyNode(),
