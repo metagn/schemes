@@ -1,5 +1,7 @@
 import macros, strutils, deques, tables, schemes/util, options
 
+# TODO: allow state let/vars to depend on each other in value (might be nim bug)
+
 type
   State* = ref object
     name*: string
@@ -188,11 +190,13 @@ proc semState(sch: Scheme, name: string, kindNode: NimNode, stmtList: NimNode, i
   sch.states.add(s)
 
 macro addState*(sn) =
+  # modifies currentScheme
   let (isDefault, sn) = if sn.kind in CallNodes and sn[0].eqIdent"default": (true, sn[1]) else: (false, sn)
   let (name, kindNode) = if sn.kind == nnkInfix: ($sn[1], sn[2]) else: ($sn, nil)
   semState(currentScheme, name, kindNode, nil, isDefault)
 
 macro state*(body) =
+  # modifies currentScheme
   let state = currentScheme.states[^1]
   if body.kind == nnkStmtList:
     for b in body: semStateLine(state, currentScheme, b)
@@ -200,11 +204,13 @@ macro state*(body) =
     semStateLine(state, currentScheme, body)
 
 macro state*(sn, body) =
+  # modifies currentScheme
   let (isDefault, sn) = if sn.kind in CallNodes and sn[0].eqIdent"default": (true, sn[1]) else: (false, sn)
   let (name, kindNode) = if sn.kind == nnkInfix: ($sn[1], sn[2]) else: ($sn, nil)
   semState(currentScheme, name, kindNode, body, isDefault)
 
 macro initScheme*(sn; flags: static[set[SchemeFlags]]) =
+  # modifies currentScheme
   let (name, kindType) = if sn.kind == nnkInfix: ($sn[1], sn[2]) else: ($sn, nil)
   let sch = Scheme()
   schemeTable[name] = sch
@@ -213,9 +219,11 @@ macro initScheme*(sn; flags: static[set[SchemeFlags]]) =
   initScheme(currentScheme, name, flags, kindType)
 
 macro initScheme*(sn) =
+  # modifies currentScheme
   result = getAst(initScheme(sn, {}))
 
 macro shared*(body) =
+  # modifies currentScheme
   case body.kind
   of nnkStmtList:
     result = newStmtList()
@@ -260,37 +268,104 @@ macro shared*(body) =
     result = body
 
 proc semLine(sch: Scheme, st: NimNode) =
-  if st.kind in RoutineNodes and st[4].findIdent"behavior" >= 0:
-    sch.behaviors.add((skipPostfixPragma(st[0]).strVal, st, nil))
-    if st[4].findIdent"init" >= 0:
-      sch.initBehavior = some sch.behaviors.high
-    sch.flow.add((true, st))
-    return
-  elif st.kind in {nnkCall, nnkCommand} and st[0].kind in {nnkIdent, nnkSym}:
-    if st[0].eqIdent"state":
-      let stn = st[1]
-      let (name, kindNode) = if stn.kind == nnkInfix: ($stn[1], stn[2]) else: ($stn, nil)
-      sch.semState(name, kindNode, if st.len < 3: nil else: st[2])
+  # TODO: make this the main way of defining schemes
+  var addToFlow = false
+  case st.kind
+  of nnkStmtList:
+    for s in st: sch.semLine(s)
+  of RoutineNodes:
+    if st[4].findIdent"behavior" >= 0:
+      sch.behaviors.add((skipPostfix(st[0]).strVal, st, nil))
+      if st[4].findIdent"init" >= 0:
+        sch.initBehavior = some sch.behaviors.high
+      sch.flow.add((true, st))
       return
-  sch.flow.add((false, st))
+    elif st[4].findIdent"init" >= 0 or st[4].findIdent"schemeInit" >= 0:
+      sch.schemeInit = st
+      sch.schemeInitVariable = ident"result"
+    else:
+      addToFlow = true
+  of nnkCall, nnkCommand:
+    if st[0].kind in {nnkIdent, nnkSym}:
+      if st[0].eqIdent"state":
+        let stn = st[1]
+        let (name, kindNode) = if stn.kind == nnkInfix: ($stn[1], stn[2]) else: ($stn, nil)
+        sch.semState(name, kindNode, if st.len < 3: nil else: st[2])
+      elif st[0].eqIdent"behaviors" and st.len == 2 and st[1].kind == nnkStmtList:
+        for behavior in st[1]:
+          sch.behaviors.add((skipPostfix(behavior[0]).strVal, behavior, nil))
+          if st[4].findIdent"init" >= 0:
+            sch.initBehavior = some sch.behaviors.high
+          sch.flow.add((true, behavior))
+      elif st[0].eqIdent"behaviorDefault" and st.len == 3:
+        let name = $st[1]
+        for beh in sch.behaviors.mitems:
+          if beh.name == name:
+            beh.default = st[2]
+      elif st[0].eqIdent"shared" and st.len == 2:
+        # just spreads to semLine for compatibility
+        for b in st[1]:
+          sch.semLine(b)
+      elif st[0].eqIdent"inject":
+        sch.semLine(st[1])
+      else:
+        addToFlow = true
+  of nnkVarSection, nnkLetSection:
+    for v in st:
+      var typ: NimNode
+      let defs = newTree(nnkIdentDefs)
+      let last2 = v.len - 2
+      let value = v[last2 + 1]
+      let valueExists = value.kind != nnkEmpty
+      for i in 0..<last2:
+        defs.add(v[i])
+        if valueExists:
+          sch.sharedDefaultAssignments.addToList(
+            newAssignment(
+              newDotExpr(
+                if scfSpreadShared in sch.flags:
+                  sch.stateArgumentName
+                else:
+                  sch.schemeInitVariable,
+                if scfSharedObj in sch.flags:
+                  newDotExpr(ident"shared", v[i])
+                else:
+                  v[i]),
+              value))
+      if v[last2].kind != nnkEmpty:
+        typ = v[last2]
+      else:
+        typ = quote do: typeof(`value`)
+      defs.add(typ)
+      defs.add(newEmptyNode()) # objects need this to be empty
+      sch.shared.add(defs)
+      if scfSpreadShared in sch.flags:
+        for s in sch.states:
+          s.obj.insert(0, defs)
+  else:
+    addToFlow = true
+  if addToFlow: sch.flow.add((false, st))
 
 macro behavior*(st) =
+  # modifies currentScheme, implemented in semLine
   result = newEmptyNode()
   if st.kind == nnkStmtList:
     for s in st:
       discard getAst(behavior(s))
   else:
-    currentScheme.behaviors.add((st[0].skipPostfixPragma.strVal, st, nil))
+    currentScheme.behaviors.add((st[0].skipPostfix.strVal, st, nil))
     if st[4].findIdent"init" >= 0:
       currentScheme.initBehavior = some currentScheme.behaviors.high
     currentScheme.flow.add((true, st))
 
 macro behaviorDefault*(name, body) =
+  # modifies currentScheme, implemented in semLine
   for beh in currentScheme.behaviors.mitems:
     if beh.name == $name:
       beh.default = body
 
 macro inject*(st) =
+  # modifies currentScheme, implemented in semLine
   result = newEmptyNode()
   if st.kind == nnkStmtList:
     for s in st:
@@ -299,6 +374,7 @@ macro inject*(st) =
     currentScheme.flow.add((false, st))
 
 macro registerHandle*(body) =
+  # modifies currentScheme
   if body.kind == nnkStmtList:
     result = newStmtList()
     for s in body:
@@ -330,6 +406,7 @@ macro registerHandle*(body) =
             `templateBody`
 
 macro handle*(sig, body): untyped =
+  # modifies currentScheme
   let nameIdent = sig[0]
   let name = newLit($nameIdent)
   var params: seq[NimNode]
@@ -348,6 +425,7 @@ macro handle*(sig, body): untyped =
           `templateBody`
 
 macro schemeInit*(varName, routine): untyped =
+  # modifies currentScheme
   result = newEmptyNode()
   case routine.kind
   of nnkStmtList:
@@ -360,6 +438,7 @@ macro schemeInit*(varName, routine): untyped =
     error("unknown scheme init node kind " & $routine.kind, routine)
 
 template schemeInit*(routine): untyped =
+  # modifies currentScheme, implemented in semLine
   schemeInit(result, routine)
 
 proc finishScheme(sch: Scheme): NimNode =
@@ -564,6 +643,7 @@ proc finishScheme(sch: Scheme): NimNode =
   #echo result.repr
 
 macro endScheme*() =
+  # modifies currentScheme
   result = finishScheme(currentScheme)
   if schemeQueue.peekLast == currentScheme:
     schemeQueue.shrink(fromLast = 1)
