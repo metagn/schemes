@@ -21,6 +21,7 @@ type
     scfSpreadShared # put shared fields in every object
     scfSharedObj # separate SchemeSharedObj type for shared fields
     scfEnumNoPrefix # no enum prefix for kind names
+    scfEnumKindSuffix # "Kind" suffix for enum
 
   Scheme* = ref object
     name*: string
@@ -28,7 +29,7 @@ type
     shared*: seq[NimNodeOf[nnkIdentDefs]]
     kindType*: NimNode
     stateEnum*: NimNodeOf[nnkEnumTy]
-    stateEnumPrefix*: string
+    stateEnumPrefix*, stateEnumSuffix*: string
     flow*: seq[tuple[isbehaviorDef: bool, node: NimNode]]
     behaviors*: seq[tuple[name: string, impl, default: NimNode]]
     initBehavior*: Option[int]
@@ -45,12 +46,27 @@ var schemeQueue* {.compileTime.} = initDeque[Scheme]()
 var currentScheme* {.compileTime.}: Scheme
 var schemeTable* {.compileTime.}: Table[string, Scheme]
 
+# options to not make everything global:
+# - handles:
+#   1. all handles are in a global cache:
+#     - there are 2 passes to evaluate states,
+#       the first one generates an AST-generator (probably with quote do,
+#       everything is going to break),
+#       then the AST this generator generates is passed
+#     - handles are either proc defs or template defs
+#       or symbols that will be used
+#   2. don't use templates/procs, implement them as custom AST replacements
+# - we need parseFile for includeState
+# - top level `when` is pretty much impossible,
+#   we need a cache before the scheme for keeping track of constant bools
+#   then checking for them in `option constName:`
+
 proc maybeExport(sch: Scheme, idnt: NimNode): NimNode =
   if scfPublic in sch.flags: postfix(idnt, "*") else: idnt
 
 proc addToEnum(sch: Scheme, state: State) =
   if not sch.stateEnum.isNil:
-    state.kindNode = ident(sch.stateEnumPrefix & state.name)
+    state.kindNode = ident(sch.stateEnumPrefix & state.name & sch.stateEnumSuffix)
     sch.stateEnum.add(state.kindNode)
 
 proc initScheme(sch: Scheme, name: string, flags: set[SchemeFlags], kindType: NimNode) =
@@ -58,11 +74,13 @@ proc initScheme(sch: Scheme, name: string, flags: set[SchemeFlags], kindType: Ni
   sch.flags = flags
   if kindType.isNil:
     sch.stateEnum = newTree(nnkEnumTy, newEmptyNode())
-    if scfEnumNoPrefix notin flags:
+    if scfEnumNoPrefix notin sch.flags:
       for ch in name:
         if isUpperAscii(ch):
           sch.stateEnumPrefix.add(toLowerAscii(ch))
       sch.stateEnumPrefix.add('s')
+    if scfEnumKindSuffix in sch.flags:
+      sch.stateEnumSuffix = "Kind"
     sch.kindType = ident(sch.name & "Kind")
   else:
     sch.kindType = kindType
@@ -122,7 +140,7 @@ proc semStateLine(s: State, sch: Scheme, stmt: NimNode) =
                   body = (quote do:
                     `stname`.`objName`.`a`),
                   pragmas = newTree(nnkPragma, ident"used")))
-            if {scfSpreadShared, scfSharedObj} <= sch.flags:
+            if {scfSharedObj, scfSpreadShared} <= sch.flags:
               for v in sch.shared:
                 for vi in 0..<v.len - 2:
                   let a = skipPostfixPragma(v[vi])
@@ -178,7 +196,11 @@ proc semState(sch: Scheme, name: string, kindNode: NimNode, stmtList: NimNode, i
   s.obj = newTree(nnkRecList,
     if scfSpreadShared in sch.flags:
       if scfSharedObj in sch.flags:
-        @[newIdentDefs(ident"shared", ident(sch.name & (if scfDeepRef in sch.flags: "Shared" else: "SharedObj")))]
+        @[newIdentDefs(ident"shared", ident(sch.name & (
+          if scfDeepRef in sch.flags and scfVar notin sch.flags:
+            "Shared"
+          else:
+            "SharedObj")))]
       else:
         sch.shared
     else:
@@ -188,6 +210,87 @@ proc semState(sch: Scheme, name: string, kindNode: NimNode, stmtList: NimNode, i
   for stmt in stmtList:
     semStateLine(s, sch, stmt)
   sch.states.add(s)
+
+proc semLine(sch: Scheme, st: NimNode) =
+  # TODO: make this the main way of defining schemes
+  var addToFlow = false
+  case st.kind
+  of nnkStmtList:
+    for s in st: sch.semLine(s)
+  of RoutineNodes:
+    if st[4].findIdent"behavior" >= 0:
+      sch.behaviors.add((skipPostfix(st[0]).strVal, st, nil))
+      if st[4].findIdent"init" >= 0:
+        sch.initBehavior = some sch.behaviors.high
+      sch.flow.add((true, st))
+      return
+    elif st[4].findIdent"init" >= 0 or st[4].findIdent"schemeInit" >= 0:
+      sch.schemeInit = st
+      sch.schemeInitVariable = ident"result"
+    else:
+      addToFlow = true
+  of nnkCall, nnkCommand:
+    if st[0].kind in {nnkIdent, nnkSym}:
+      if st[0].eqIdent"state":
+        let stn = st[1]
+        let (name, kindNode) = if stn.kind == nnkInfix: ($stn[1], stn[2]) else: ($stn, nil)
+        sch.semState(name, kindNode, if st.len < 3: nil else: st[2])
+      elif st[0].eqIdent"behaviors" and st.len == 2 and st[1].kind == nnkStmtList:
+        for behavior in st[1]:
+          sch.behaviors.add((skipPostfix(behavior[0]).strVal, behavior, nil))
+          if behavior[4].findIdent"init" >= 0:
+            sch.initBehavior = some sch.behaviors.high
+          sch.flow.add((true, behavior))
+      elif st[0].eqIdent"behaviorDefault" and st.len == 3:
+        let name = $st[1]
+        for beh in sch.behaviors.mitems:
+          if beh.name == name:
+            beh.default = st[2]
+      elif st[0].eqIdent"shared" and st.len == 2:
+        # just spreads to semLine for compatibility
+        for b in st[1]:
+          sch.semLine(b)
+      elif st[0].eqIdent"inject":
+        sch.semLine(st[1])
+      else:
+        addToFlow = true
+  of nnkVarSection, nnkLetSection:
+    for v in st:
+      var typ: NimNode
+      let defs = newTree(nnkIdentDefs)
+      let last2 = v.len - 2
+      let value = v[last2 + 1]
+      let valueExists = value.kind != nnkEmpty
+      for i in 0..<last2:
+        defs.add(v[i])
+        if valueExists:
+          let name = skipPostfixPragma(v[i])
+          let sharedObj =
+            if scfSpreadShared in sch.flags:
+              sch.stateArgumentName
+            else:
+              sch.schemeInitVariable
+          sch.sharedDefaultAssignments.addToList(
+            newAssignment(
+              newDotExpr(sharedObj,
+                if scfSharedObj in sch.flags:
+                  newDotExpr(ident"shared", name)
+                else:
+                  name),
+              value))
+      if v[last2].kind != nnkEmpty:
+        typ = v[last2]
+      else:
+        typ = quote do: typeof(`value`)
+      defs.add(typ)
+      defs.add(newEmptyNode()) # objects need this to be empty
+      sch.shared.add(defs)
+      if scfSpreadShared in sch.flags:
+        for s in sch.states:
+          s.obj.insert(0, defs)
+  else:
+    addToFlow = true
+  if addToFlow: sch.flow.add((false, st))
 
 macro addState*(sn) =
   # modifies currentScheme
@@ -222,8 +325,22 @@ macro initScheme*(sn) =
   # modifies currentScheme
   result = getAst(initScheme(sn, {}))
 
-macro shared*(body) =
+macro initScheme*(sn; flags: static[set[SchemeFlags]]; body) =
   # modifies currentScheme
+  let (name, kindType) = if sn.kind == nnkInfix: ($sn[1], sn[2]) else: ($sn, nil)
+  let sch = Scheme()
+  schemeTable[name] = sch
+  schemeQueue.addLast(sch)
+  currentScheme = sch
+  initScheme(currentScheme, name, flags, kindType)
+  if body.kind == nnkStmtList:
+    for b in body:
+      currentScheme.semLine(b)
+  else:
+    currentScheme.semLine(body)
+
+macro shared*(body) =
+  # modifies currentScheme, implemented in semLine as var/let
   case body.kind
   of nnkStmtList:
     result = newStmtList()
@@ -266,85 +383,6 @@ macro shared*(body) =
           s.obj.insert(0, defs)
   else:
     result = body
-
-proc semLine(sch: Scheme, st: NimNode) =
-  # TODO: make this the main way of defining schemes
-  var addToFlow = false
-  case st.kind
-  of nnkStmtList:
-    for s in st: sch.semLine(s)
-  of RoutineNodes:
-    if st[4].findIdent"behavior" >= 0:
-      sch.behaviors.add((skipPostfix(st[0]).strVal, st, nil))
-      if st[4].findIdent"init" >= 0:
-        sch.initBehavior = some sch.behaviors.high
-      sch.flow.add((true, st))
-      return
-    elif st[4].findIdent"init" >= 0 or st[4].findIdent"schemeInit" >= 0:
-      sch.schemeInit = st
-      sch.schemeInitVariable = ident"result"
-    else:
-      addToFlow = true
-  of nnkCall, nnkCommand:
-    if st[0].kind in {nnkIdent, nnkSym}:
-      if st[0].eqIdent"state":
-        let stn = st[1]
-        let (name, kindNode) = if stn.kind == nnkInfix: ($stn[1], stn[2]) else: ($stn, nil)
-        sch.semState(name, kindNode, if st.len < 3: nil else: st[2])
-      elif st[0].eqIdent"behaviors" and st.len == 2 and st[1].kind == nnkStmtList:
-        for behavior in st[1]:
-          sch.behaviors.add((skipPostfix(behavior[0]).strVal, behavior, nil))
-          if st[4].findIdent"init" >= 0:
-            sch.initBehavior = some sch.behaviors.high
-          sch.flow.add((true, behavior))
-      elif st[0].eqIdent"behaviorDefault" and st.len == 3:
-        let name = $st[1]
-        for beh in sch.behaviors.mitems:
-          if beh.name == name:
-            beh.default = st[2]
-      elif st[0].eqIdent"shared" and st.len == 2:
-        # just spreads to semLine for compatibility
-        for b in st[1]:
-          sch.semLine(b)
-      elif st[0].eqIdent"inject":
-        sch.semLine(st[1])
-      else:
-        addToFlow = true
-  of nnkVarSection, nnkLetSection:
-    for v in st:
-      var typ: NimNode
-      let defs = newTree(nnkIdentDefs)
-      let last2 = v.len - 2
-      let value = v[last2 + 1]
-      let valueExists = value.kind != nnkEmpty
-      for i in 0..<last2:
-        defs.add(v[i])
-        if valueExists:
-          sch.sharedDefaultAssignments.addToList(
-            newAssignment(
-              newDotExpr(
-                if scfSpreadShared in sch.flags:
-                  sch.stateArgumentName
-                else:
-                  sch.schemeInitVariable,
-                if scfSharedObj in sch.flags:
-                  newDotExpr(ident"shared", v[i])
-                else:
-                  v[i]),
-              value))
-      if v[last2].kind != nnkEmpty:
-        typ = v[last2]
-      else:
-        typ = quote do: typeof(`value`)
-      defs.add(typ)
-      defs.add(newEmptyNode()) # objects need this to be empty
-      sch.shared.add(defs)
-      if scfSpreadShared in sch.flags:
-        for s in sch.states:
-          s.obj.insert(0, defs)
-  else:
-    addToFlow = true
-  if addToFlow: sch.flow.add((false, st))
 
 macro behavior*(st) =
   # modifies currentScheme, implemented in semLine
@@ -520,7 +558,11 @@ proc finishScheme(sch: Scheme): NimNode =
   let schemeObj = newTree(nnkRecList,
     if scfSpreadShared in sch.flags: @[]
     elif scfSharedObj in sch.flags: @[newIdentDefs(
-      ident"shared", ident(sch.name & (if scfDeepRef in sch.flags: "Shared" else: "SharedObj")))]
+      ident"shared", ident(sch.name & (
+        if scfDeepRef in sch.flags and scfVar notin sch.flags:
+          "Shared"
+        else:
+          "SharedObj")))]
     else: sch.shared)
   schemeObj.add(stateCase)
   let objTree = newTree(nnkTypeSection,
@@ -584,23 +626,32 @@ proc finishScheme(sch: Scheme): NimNode =
       if scfSpreadShared notin sch.flags:
         for v in sch.shared:
           for vi in 0..<v.len - 2:
-            let a = skipPostfixPragma(v[vi])
+            let a = ident repr skipPostfixPragma(v[vi])
             var ob = sch.stateArgumentName
             if scfSharedObj in sch.flags:
               ob = newDotExpr(ob, ident"shared") 
-            f[6].insert(0, newProc(
+            let t = newProc(
               name = a, procType = nnkTemplateDef,
               params = [ident"auto"],
-              body = newDotExpr(ob, a),
-              pragmas = newTree(nnkPragma, ident"used")))
+              body = newStmtList(
+                # should really use these comment statements for debugging
+                newCommentStmtNode("behavior: " & $f[0]),
+                newDotExpr(ob, a)
+              ),
+              pragmas = newTree(nnkPragma, ident"used"))
+            # weird workaround:
+            f[6].insert(0, quote do:
+              when not compiles((let _ = `a`;)):
+                `t`)
       var pragmas = f[4]
       var isInit = false
       if pragmas.kind != nnkEmpty:
-        if (let behi = pragmas.findIdent"behavior"; behi) >= 0:
+        if (let behi = pragmas.findIdent"behavior"; behi >= 0):
           pragmas.del(behi)
-        if (let ini = pragmas.findIdent"init"; ini) >= 0:
+        if (let ini = pragmas.findIdent"init"; ini >= 0):
           pragmas.del(ini)
           isInit = true
+        if isInit:
           if scfSpreadShared in sch.flags:
             f[6].insert(0, sch.sharedDefaultAssignments)
             assignedSchemeDefaults = true
@@ -633,6 +684,10 @@ proc finishScheme(sch: Scheme): NimNode =
     let init = copy sch.schemeInit
     if init[6].isNil or init[6].kind == nnkEmpty: init[6] = newStmtList()
     elif init[6].kind != nnkStmtList: init[6] = newStmtList(init[6])
+    if (let ini = init[4].findIdent("init"); ini >= 0):
+      init[4].del(ini)
+    if (let ini = init[4].findIdent("schemeInit"); ini >= 0):
+      init[4].del(ini)
     if scfSpreadShared notin sch.flags:
       init[6].insert(0, sch.sharedDefaultAssignments)
       assignedSchemeDefaults = true

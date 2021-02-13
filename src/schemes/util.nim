@@ -18,7 +18,7 @@ proc findIdent*(a: NimNode, b: string): int =
   -1
 
 proc skipPostfix*(a: NimNode): NimNode =
-  if a.kind == nnkPostfix: a[1] else: a
+  result = if a.kind == nnkPostfix: a[1] else: a
 
 proc skipPostfixPragma*(a: NimNode): NimNode =
   result = a
