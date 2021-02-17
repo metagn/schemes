@@ -108,12 +108,14 @@ proc semStateLine(s: State, sch: Scheme, stmt: NimNode) =
       if v[^1].kind != nnkEmpty:
         let val = v[^1]
         if typ.isNil:
-          typ = quote do: typeof(`val`)
+          typ = newNimNode(nnkCall, val)
+          typ.add(bindSym"typeof")
+          typ.add(val)
         let setter = newStmtList()
         let objName = s.objPropName
         let stname = sch.stateArgumentName
         for id in defs:
-          setter.add(quote do: `stname`.`objName`.`id` = `val`)
+          setter.add(newAssignment(newDotExpr(newDotExpr(stname, objName), id), val))
         if sch.initBehavior.isSome:
           s.behaviorImpls[sch.initBehavior.get].addOrSetList(setter)
       defs.add(typ)
