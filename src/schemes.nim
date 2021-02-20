@@ -61,8 +61,11 @@ var schemeTable* {.compileTime.}: Table[string, Scheme]
 #   we need a cache before the scheme for keeping track of constant bools
 #   then checking for them in `option constName:`
 
-proc maybeExport(sch: Scheme, idnt: NimNode): NimNode =
-  if scfPublic in sch.flags: postfix(idnt, "*") else: idnt
+proc maybeExportUsed(sch: Scheme, idnt: NimNode): NimNode =
+  if scfPublic in sch.flags:
+    postfix(idnt, "*")
+  else:
+    newTree(nnkPragmaExpr, idnt, newTree(nnkPragma, ident"used"))
 
 proc addToEnum(sch: Scheme, state: State) =
   if not sch.stateEnum.isNil:
@@ -150,12 +153,15 @@ proc semStateLine(s: State, sch: Scheme, stmt: NimNode) =
                 if scfSpreadShared in sch.flags:
                   ob = newDotExpr(ob, objName)
                 if scfSharedObj in sch.flags:
-                  ob = newDotExpr(ob, ident"shared") 
-                stmt.last.insert(0, newProc(
+                  ob = newDotExpr(ob, ident"shared")
+                let t = newProc(
                   name = a, procType = nnkTemplateDef,
                   params = [ident"auto"],
                   body = newDotExpr(ob, a),
-                  pragmas = newTree(nnkPragma, ident"used")))
+                  pragmas = newTree(nnkPragma, ident"used"))
+                stmt.last.insert(0, quote do:
+                  when not compiles((let _ {.inject.} = `a`();)):
+                    `t`)
             s.behaviorImpls[i].addOrSetList(stmt.last)
             return
         if explicitBehavior:
@@ -276,11 +282,11 @@ proc semLine(sch: Scheme, st: NimNode) =
               sch.schemeInitVariable
           sch.sharedDefaultAssignments.addToList(
             newAssignment(
-              newDotExpr(sharedObj,
+              newDotExpr(
                 if scfSharedObj in sch.flags:
-                  newDotExpr(ident"shared", name)
+                  newDotExpr(sharedObj, ident"shared")
                 else:
-                  name),
+                  sharedObj, name),
               value))
       if v[last2].kind != nnkEmpty:
         typ = v[last2]
@@ -343,6 +349,14 @@ macro initScheme*(sn; flags: static[set[SchemeFlags]]; body) =
   else:
     currentScheme.semLine(body)
 
+macro doScheme*(body) =
+  result = newEmptyNode()
+  if body.kind == nnkStmtList:
+    for b in body:
+      currentScheme.semLine(b)
+  else:
+    currentScheme.semLine(body)
+
 macro shared*(body) =
   # modifies currentScheme, implemented in semLine as var/let
   case body.kind
@@ -363,17 +377,17 @@ macro shared*(body) =
       for i in 0..<last2:
         defs.add(v[i])
         if valueExists:
+          let n = if scfSpreadShared in currentScheme.flags:
+            currentScheme.stateArgumentName
+          else:
+            currentScheme.schemeInitVariable
           currentScheme.sharedDefaultAssignments.addToList(
             newAssignment(
               newDotExpr(
-                if scfSpreadShared in currentScheme.flags:
-                  currentScheme.stateArgumentName
-                else:
-                  currentScheme.schemeInitVariable,
                 if scfSharedObj in currentScheme.flags:
-                  newDotExpr(ident"shared", v[i])
+                  newDotExpr(n, ident"shared")
                 else:
-                  v[i]),
+                  n, v[i]),
               value))
       if v[last2].kind != nnkEmpty:
         typ = v[last2]
@@ -488,22 +502,22 @@ proc finishScheme(sch: Scheme): NimNode =
   result = newNimNode(nnkStmtList)
   if not sch.stateEnum.isNil:
     result.add(newTree(nnkTypeSection,
-      newTree(nnkTypeDef, sch.maybeExport(sch.kindType), newEmptyNode(), sch.stateEnum)))
+      newTree(nnkTypeDef, sch.maybeExportUsed(sch.kindType), newEmptyNode(), sch.stateEnum)))
   if scfSharedObj in sch.flags:
     let sharedObjTy = newTree(nnkObjectTy, newEmptyNode(), newEmptyNode(), newTree(nnkRecList, sch.shared))
     let ts = newTree(nnkTypeSection,
       newTree(nnkTypeDef,
-        sch.maybeExport(ident(sch.name & "SharedObj")),
+        sch.maybeExportUsed(ident(sch.name & "SharedObj")),
         newEmptyNode(),
         sharedObjTy))
     if scfRef in sch.flags:
       ts.add(newTree(nnkTypeDef,
-        sch.maybeExport(ident(sch.name & "Shared")),
+        sch.maybeExportUsed(ident(sch.name & "Shared")),
         newEmptyNode(),
         newTree(nnkRefTy, ident(sch.name & "SharedObj"))))
     elif scfVar in sch.flags:
       ts.add(newTree(nnkTypeDef,
-        sch.maybeExport(ident(sch.name & "Shared")),
+        sch.maybeExportUsed(ident(sch.name & "Shared")),
         newEmptyNode(),
         newTree(nnkVarTy, ident(sch.name & "SharedObj"))))
     result.add(ts)
@@ -522,12 +536,12 @@ proc finishScheme(sch: Scheme): NimNode =
     else:
       let obj = newTree(nnkObjectTy, newEmptyNode(), newEmptyNode(), s.obj)
       let id = ident(s.name & "Obj")
-      let typedef = newTree(nnkTypeDef, sch.maybeExport(id), newEmptyNode(), obj)
+      let typedef = newTree(nnkTypeDef, sch.maybeExportUsed(id), newEmptyNode(), obj)
       let ts = newTree(nnkTypeSection, typedef)
       let cmnId = ident(s.name)
       if {scfRef, scfVar} * sch.flags != {} and scfEnumNoPrefix notin sch.flags:
         let cmnTypedef = newTree(nnkTypeDef,
-          newTree(nnkPragmaExpr, sch.maybeExport(cmnId), newTree(nnkPragma, ident"used")),
+          sch.maybeExportUsed(cmnId),
           newEmptyNode(),
           newTree(if scfRef in sch.flags: nnkRefTy else: nnkVarTy, id))
         ts.add(cmnTypedef)
@@ -571,12 +585,12 @@ proc finishScheme(sch: Scheme): NimNode =
   if stateCase.len > 1:
     schemeObj.add(stateCase)
   let objTree = newTree(nnkTypeSection,
-    newTree(nnkTypeDef, sch.maybeExport(stateObjName), newEmptyNode(),
+    newTree(nnkTypeDef, sch.maybeExportUsed(stateObjName), newEmptyNode(),
       newTree(nnkObjectTy, newEmptyNode(), newEmptyNode(),
         schemeObj)))
   if {scfRef, scfVar} * sch.flags != {}:
     objTree.add(newTree(nnkTypeDef,
-      sch.maybeExport(ident(sch.name)),
+      sch.maybeExportUsed(ident(sch.name)),
       newEmptyNode(),
       newTree(if scfRef in sch.flags: nnkRefTy else: nnkVarTy, stateObjName)))
   result.add(objTree)
@@ -702,11 +716,14 @@ proc finishScheme(sch: Scheme): NimNode =
           var ob = sch.schemeInitVariable
           if scfSharedObj in sch.flags:
             ob = newDotExpr(ob, ident"shared") 
-          init[6].insert(0, newProc(
+          let t = newProc(
             name = a, procType = nnkTemplateDef,
             params = [ident"auto"],
             body = newDotExpr(ob, a),
-            pragmas = newTree(nnkPragma, ident"used")))
+            pragmas = newTree(nnkPragma, ident"used"))
+          init[6].insert(0, quote do:
+            when not compiles((let _ {.inject.} = `a`();)):
+              `t`)
     result.add(init)
   
   if not sch.sharedDefaultAssignments.isNil and not assignedSchemeDefaults:
